@@ -17,13 +17,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from . import indicators
 from .logging_setup import get_logger
 from .market import MarketStore, TickerState
+
+if TYPE_CHECKING:
+    from .orderbook import OrderBook
 
 log = get_logger(__name__)
 
@@ -46,7 +49,7 @@ class Position:
     ticker: str
     quantity: int
     avg_cost: Decimal
-    peak_price: Decimal     # highest price seen since entry — drives trailing stop
+    peak_price: Decimal     # highest price seen since entry - drives trailing stop
 
 
 @dataclass
@@ -65,13 +68,15 @@ class PortfolioView:
 
 # ---------------------------------------------------------------------- constants
 
-# Hard-coded defaults — the bot self-tunes nothing the user touches.
+# Hard-coded defaults - the bot self-tunes nothing the user touches.
 WATCHLIST_SIZE = 5
 ENTRY_FRACTION = Decimal("0.15")     # 15% of equity on first entry
 ATR_STOP_MULTIPLIER = 2.0            # trailing stop = peak - 2.0 * ATR
 HARD_STOP_PCT = Decimal("-0.03")     # -3% from average cost
 MIN_PRICES_FOR_SCORING = 31          # need ~30 closes for ATR/breakout/volume_surge
 MIN_TICKERS_FOR_ENTRY = 5            # don't try to enter before we have 5+ candidates
+
+ONE_TICK = Decimal("0.01")
 
 
 # ------------------------------------------------------------------- core function
@@ -87,6 +92,7 @@ class Strategy:
         self,
         market: MarketStore,
         portfolio: PortfolioView,
+        orderbook: "OrderBook | None" = None,
     ) -> list[OrderIntent]:
         """Run one tick of the decision pipeline. Returns intents to act on."""
         intents: list[OrderIntent] = []
@@ -115,7 +121,8 @@ class Strategy:
                 state = market.get(ticker)
                 if state is None or state.price <= 0:
                     continue
-                entry = self._entry_intent(state, equity, portfolio.cash)
+                best_ask = orderbook.best_ask(ticker) if orderbook else None
+                entry = self._entry_intent(state, equity, portfolio.cash, best_ask=best_ask)
                 if entry is not None:
                     intents.append(entry)
 
@@ -134,7 +141,7 @@ class Strategy:
             # we approximate "volume series" by repeating the latest volume.
             # The volume_surge component will be ~1.0 (neutral), so the score
             # is driven by rate_of_change + breakout_strength. That's fine for
-            # MVP — Day 3 we replace this with proper per-tick volume tracking.
+            # MVP - Day 3 we replace this with proper per-tick volume tracking.
             volumes = np.full_like(closes, state.volume, dtype=np.float64)
             score = indicators.momentum_score(closes, volumes)
             if score is not None:
@@ -146,6 +153,7 @@ class Strategy:
         state: TickerState,
         equity: Decimal,
         cash: Decimal,
+        best_ask: Decimal | None = None,
     ) -> OrderIntent | None:
         price = Decimal(str(state.price))
         notional = equity * ENTRY_FRACTION
@@ -156,8 +164,11 @@ class Strategy:
         qty = int(notional / price)
         if qty <= 0:
             return None
-        # LIMIT one tick above current price — we want fills, not bargains.
-        limit_price = (price * Decimal("1.001")).quantize(Decimal("0.01"))
+        # Use real best ask from order book when available; fall back to estimate.
+        if best_ask is not None and best_ask > 0:
+            limit_price = best_ask + ONE_TICK
+        else:
+            limit_price = (price * Decimal("1.001")).quantize(Decimal("0.01"))
         return OrderIntent(
             side="BUY",
             ticker=state.ticker,

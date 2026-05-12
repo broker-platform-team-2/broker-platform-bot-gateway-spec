@@ -2,13 +2,16 @@
 Async WebSocket consumer for /notifications/ws.
 
 One socket carries everything we need:
-  * PRICE_UPDATE       — per-ticker tick (drives the market store)
-  * ORDER_UPDATE       — fill / partial-fill / cancel for our own orders
-  * MARKET_EVENT       — BULL_RUN / BEAR_CRASH / SECTOR_BOOM / SECTOR_SLUMP / STOCK_SHOCK
-  * ORDER_BOOK_UPDATE  — top-of-book changes
+  * PRICE_UPDATE       - per-ticker tick (drives the market store)
+  * ORDER_UPDATE       - fill / partial-fill / cancel for our own orders
+  * MARKET_EVENT       - BULL_RUN / BEAR_CRASH / SECTOR_BOOM / SECTOR_SLUMP / STOCK_SHOCK
+  * ORDER_BOOK_UPDATE  - top-of-book changes
 
 Consumers register handlers per message type. The loop auto-reconnects with
 exponential backoff so transient network blips don't kill the bot.
+
+When REPLAY_RECORD=1, every incoming message is forwarded to an attached
+RunRecorder (set via set_recorder()) so runs can be replayed deterministically.
 """
 from __future__ import annotations
 
@@ -17,14 +20,18 @@ import json
 import random
 import urllib.parse
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import websockets
 
 from .config import Settings
 from .logging_setup import get_logger
 
+if TYPE_CHECKING:
+    from .replay import RunRecorder
+
 log = get_logger(__name__)
+
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -36,6 +43,11 @@ class WsClient:
         self._handlers: dict[str, list[Handler]] = {}
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._recorder: "RunRecorder | None" = None
+
+    def set_recorder(self, recorder: "RunRecorder") -> None:
+        """Attach a RunRecorder to write every WS message to a JSONL file."""
+        self._recorder = recorder
 
     def on(self, message_type: str, handler: Handler) -> None:
         """Register an async handler for a message type (PRICE_UPDATE, ...)."""
@@ -83,7 +95,7 @@ class WsClient:
     async def _connect_and_consume(self) -> None:
         token = self._get_token()
         if not token:
-            raise RuntimeError("No JWT available — call HttpClient.authenticate() first")
+            raise RuntimeError("No JWT available - call HttpClient.authenticate() first")
 
         url = f"{self._settings.gateway_ws_url}?token={urllib.parse.quote(token)}"
         log.info("ws.connect", url=self._settings.gateway_ws_url)
@@ -104,6 +116,13 @@ class WsClient:
 
             msg_type = msg.get("type")
             payload = msg.get("payload") or {}
+
+            if self._recorder is not None:
+                try:
+                    self._recorder.record_ws(msg_type, payload)
+                except Exception:  # noqa: BLE001
+                    pass
+
             handlers = self._handlers.get(msg_type, [])
             if not handlers:
                 log.debug("ws.unhandled", type=msg_type)

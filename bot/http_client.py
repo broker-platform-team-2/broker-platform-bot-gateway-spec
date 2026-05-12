@@ -186,3 +186,19 @@ class HttpClient:
     async def cancel_order(self, order_id: str | int) -> None:
         r = await self._request("DELETE", f"/orders/{order_id}")
         r.raise_for_status()
+
+    async def get_portfolio_ticker_qty(self, ticker: str) -> int:
+        """Return the current held quantity for ticker from GET /portfolio, or 0.
+
+        Used by the executor's reconcile-then-retry path to check whether a
+        timed-out order actually landed before deciding to retry.
+        """
+        try:
+            holdings = await self.get_portfolio()
+            for h in holdings:
+                t = h.get("instrumentId") or h.get("ticker")
+                if t == ticker:
+                    return int(h.get("amount") or h.get("quantity") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
