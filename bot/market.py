@@ -1,9 +1,9 @@
 """
 In-memory market state.
 
-Day 1: minimal — last price + last update timestamp per ticker, plus a
-list of recent prices for quick inspection. Day 2 swaps this for a numpy
-ring buffer of OHLC bars used by the indicators.
+Tracks per-ticker close prices and per-tick volumes in bounded ring
+buffers, plus sector for event-routing. Fed by PRICE_UPDATE messages
+from the WebSocket and seeded once at boot from /market/stocks.
 """
 from __future__ import annotations
 
@@ -15,12 +15,14 @@ from typing import Any
 @dataclass
 class TickerState:
     ticker: str
+    sector: str = ""
     price: float = 0.0
     change: float = 0.0
     change_pct: float = 0.0
     volume: float = 0.0
     market_time: str = ""
     recent: deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    volumes: deque[float] = field(default_factory=lambda: deque(maxlen=120))
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -46,13 +48,17 @@ class MarketStore:
             price = _to_float(
                 s.get("current_price") or s.get("currentPrice") or s.get("price")
             )
-            self._tickers[ticker] = TickerState(
+            volume = _to_float(s.get("volume"))
+            state = TickerState(
                 ticker=ticker,
+                sector=s.get("sector") or s.get("industry") or "",
                 price=price,
-                volume=_to_float(s.get("volume")),
+                volume=volume,
                 market_time=s.get("market_time") or s.get("marketTime") or "",
             )
-            self._tickers[ticker].recent.append(price)
+            state.recent.append(price)
+            state.volumes.append(volume)
+            self._tickers[ticker] = state
 
     def apply_price_update(self, payload: dict[str, Any]) -> TickerState | None:
         ticker = payload.get("ticker") or payload.get("symbol")
@@ -65,7 +71,12 @@ class MarketStore:
         state.change_pct = _to_float(payload.get("change_pct") or payload.get("changePct"))
         state.volume = _to_float(payload.get("volume"), state.volume)
         state.market_time = payload.get("market_time") or payload.get("marketTime") or state.market_time
+        # Sector usually only arrives in the initial snapshot; preserve it.
+        new_sector = payload.get("sector") or payload.get("industry")
+        if new_sector:
+            state.sector = new_sector
         state.recent.append(price)
+        state.volumes.append(state.volume)
         self._tickers[ticker] = state
         return state
 
@@ -75,6 +86,12 @@ class MarketStore:
 
     def tickers(self) -> list[str]:
         return list(self._tickers.keys())
+
+    def tickers_in_sector(self, sector: str) -> list[str]:
+        if not sector:
+            return []
+        s = sector.lower()
+        return [t for t, st in self._tickers.items() if st.sector.lower() == s]
 
     def __len__(self) -> int:
         return len(self._tickers)

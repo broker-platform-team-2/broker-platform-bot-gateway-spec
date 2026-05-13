@@ -46,6 +46,62 @@ def test_buys_top_movers_when_enough_candidates():
     assert all(i.reason == "entry" for i in intents)
 
 
+def test_pyramid_intent_when_winner_still_in_watchlist():
+    """Five uptrends — one of which we already hold and is up >2% from cost."""
+    store = MarketStore()
+    for t, base in [("AAA", 100.0), ("BBB", 200.0), ("CCC", 50.0), ("DDD", 80.0), ("EEE", 60.0)]:
+        _stuff_market_with_uptrend(store, t, base)
+
+    # We hold AAA bought at 100. Current price of AAA after 40 ticks of +0.5
+    # is 100 + 0.5*39 = 119.5 — well over the +2% pyramid trigger.
+    pf = PortfolioView(
+        cash=Decimal("100000"),
+        positions={
+            "AAA": Position(ticker="AAA", quantity=20, avg_cost=Decimal("100"),
+                            peak_price=Decimal("119.5")),
+        },
+    )
+    intents = Strategy().decide(store, pf)
+    pyramids = [i for i in intents if i.reason == "pyramid"]
+    assert len(pyramids) == 1
+    assert pyramids[0].ticker == "AAA"
+    assert pyramids[0].side == "BUY"
+
+
+def test_pyramid_skipped_when_no_pop_yet():
+    store = MarketStore()
+    for t, base in [("AAA", 100.0), ("BBB", 200.0), ("CCC", 50.0), ("DDD", 80.0), ("EEE", 60.0)]:
+        _stuff_market_with_uptrend(store, t, base)
+    # Pretend we bought AAA RIGHT NOW (cost = current price). No pop yet.
+    state = store.get("AAA")
+    pf = PortfolioView(
+        cash=Decimal("100000"),
+        positions={
+            "AAA": Position(ticker="AAA", quantity=20,
+                            avg_cost=Decimal(str(state.price)),
+                            peak_price=Decimal(str(state.price))),
+        },
+    )
+    intents = Strategy().decide(store, pf)
+    pyramids = [i for i in intents if i.reason == "pyramid"]
+    assert pyramids == []
+
+
+def test_volume_surge_increases_momentum_score():
+    """A spike in per-tick volume should push the score up vs flat volume."""
+    from bot import indicators
+    import numpy as np
+
+    closes = np.array([100.0 + 0.5 * i for i in range(40)])
+    flat_volumes = np.full(40, 1000.0)
+    surge_volumes = np.concatenate([np.full(35, 1000.0), np.full(5, 5000.0)])
+
+    flat_score = indicators.momentum_score(closes, flat_volumes)
+    surge_score = indicators.momentum_score(closes, surge_volumes)
+    assert flat_score is not None and surge_score is not None
+    assert surge_score > flat_score
+
+
 def test_hard_stop_triggers_when_price_drops_below_floor():
     store = MarketStore()
     # First, build an uptrend to position level
