@@ -68,6 +68,8 @@ class PortfolioView:
 # Hard-coded defaults — the bot self-tunes nothing the user touches.
 WATCHLIST_SIZE = 5
 ENTRY_FRACTION = Decimal("0.15")     # 15% of equity on first entry
+PYRAMID_FRACTION = Decimal("0.10")   # 10% of equity on each add-on
+PYRAMID_TRIGGER_PCT = Decimal("0.02")  # price must be >=2% above avg cost
 ATR_STOP_MULTIPLIER = 2.0            # trailing stop = peak - 2.0 * ATR
 HARD_STOP_PCT = Decimal("-0.03")     # -3% from average cost
 MIN_PRICES_FOR_SCORING = 31          # need ~30 closes for ATR/breakout/volume_surge
@@ -119,6 +121,58 @@ class Strategy:
                 if entry is not None:
                     intents.append(entry)
 
+            # 5. Pyramid into existing winners that are still scoring high.
+            pyramid_intents = self.propose_pyramid(market, portfolio, watchlist)
+            intents.extend(pyramid_intents)
+
+        return intents
+
+    def propose_pyramid(
+        self,
+        market: MarketStore,
+        portfolio: PortfolioView,
+        watchlist: set[str],
+    ) -> list[OrderIntent]:
+        """
+        Add to winners.
+
+        For each currently-held ticker that is still in the watchlist AND has
+        rallied at least PYRAMID_TRIGGER_PCT above its average cost, emit a
+        smaller BUY intent (PYRAMID_FRACTION of current equity). The 25%
+        per-ticker risk cap will reject the add-on if the position is already
+        large enough — that's the intended brake on over-pyramiding.
+        """
+        intents: list[OrderIntent] = []
+        equity = portfolio.equity(market)
+        cash = portfolio.cash
+        for ticker, pos in portfolio.positions.items():
+            if ticker not in watchlist:
+                continue
+            state = market.get(ticker)
+            if state is None or state.price <= 0:
+                continue
+            price = Decimal(str(state.price))
+            trigger = pos.avg_cost * (Decimal("1") + PYRAMID_TRIGGER_PCT)
+            if price < trigger:
+                continue
+            notional = min(equity * PYRAMID_FRACTION, cash)
+            if notional <= 0:
+                continue
+            qty = int(notional / price)
+            if qty <= 0:
+                continue
+            limit_price = (price * Decimal("1.001")).quantize(Decimal("0.01"))
+            intents.append(OrderIntent(
+                side="BUY",
+                ticker=ticker,
+                quantity=qty,
+                order_type="LIMIT",
+                limit_price=limit_price,
+                reason="pyramid",
+            ))
+            # Note: we don't decrement `cash` here because the risk gate
+            # rechecks total exposure / cash anyway and we want each pyramid
+            # decision to be independent.
         return intents
 
     # ----------------------------------------------------------------- internals
@@ -130,12 +184,19 @@ class Strategy:
             if state is None or len(state.recent) < MIN_PRICES_FOR_SCORING:
                 continue
             closes = np.array(state.recent, dtype=np.float64)
-            # We don't get per-tick volume in PRICE_UPDATE in a vector form;
-            # we approximate "volume series" by repeating the latest volume.
-            # The volume_surge component will be ~1.0 (neutral), so the score
-            # is driven by rate_of_change + breakout_strength. That's fine for
-            # MVP — Day 3 we replace this with proper per-tick volume tracking.
-            volumes = np.full_like(closes, state.volume, dtype=np.float64)
+            # Real per-tick volume history (Track A). When the history is
+            # shorter than the price history (e.g. the ticker was added late),
+            # pad the front with the earliest known volume so the array
+            # lengths match.
+            if len(state.volumes) == len(state.recent):
+                volumes = np.array(state.volumes, dtype=np.float64)
+            else:
+                pad = state.volumes[0] if state.volumes else state.volume
+                volumes = np.array(
+                    [pad] * (len(state.recent) - len(state.volumes))
+                    + list(state.volumes),
+                    dtype=np.float64,
+                )
             score = indicators.momentum_score(closes, volumes)
             if score is not None:
                 scores[ticker] = score

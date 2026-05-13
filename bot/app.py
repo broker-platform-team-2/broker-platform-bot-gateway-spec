@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from .config import Settings
+from .events import EventReactor
 from .executor import Executor
 from .http_client import HttpClient
 from .logging_setup import configure as configure_logging, get_logger
@@ -43,6 +44,7 @@ class Bot:
         self.strategy = Strategy()
         self.risk = RiskGate()
         self.executor = Executor(self.http)
+        self.events = EventReactor(self.strategy)
 
         self.portfolio = PortfolioView(cash=Decimal("0"))
         self._price_update_counter = 0
@@ -187,7 +189,8 @@ class Bot:
             await self._reconcile_portfolio()
 
     async def _on_market_event(self, payload: dict[str, Any]) -> None:
-        # Day 3 plugs the event reactor here.
+        # Track A: event reactor runs immediately — speed matters more than
+        # confirmation here. Intents still flow through the risk gate.
         log.info(
             "market_event",
             event_type=payload.get("event_type") or payload.get("eventType"),
@@ -195,6 +198,26 @@ class Bot:
             scope=payload.get("scope"),
             target=payload.get("target"),
         )
+        # Refresh the strategy's score cache so the reactor's "top-N" ranks
+        # are based on the latest data. This is cheap (~ms).
+        self.strategy._score_all(self.market)  # noqa: SLF001 — same-package
+        intents = self.events.react(payload, self.market, self.portfolio)
+        if not intents:
+            return
+        allowed = self.risk.filter(intents, self.portfolio, self.market)
+        if not allowed:
+            return
+        log.info(
+            "event.actions",
+            event_type=payload.get("event_type") or payload.get("eventType"),
+            proposed=len(intents),
+            allowed=len(allowed),
+            actions=[
+                {"side": i.side, "ticker": i.ticker, "qty": i.quantity, "reason": i.reason}
+                for i in allowed
+            ],
+        )
+        await self.executor.submit_all(allowed)
 
     async def _on_order_book_update(self, payload: dict[str, Any]) -> None:
         log.debug("orderbook", **payload)
