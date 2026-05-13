@@ -1,7 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
 .venv/
-  .env
-  __pycache__/
-  .pytest_cache/
-  .idea/workspace.xml
-  .idea/usage.statistics.xml
-  *.pyc
+venv/
+
+# Environment variables (real, never commit)
+.env
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+
+# IDE — PyCharm
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.idea/tasks.xml
+.idea/dictionaries
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
