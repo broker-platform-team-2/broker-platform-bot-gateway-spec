@@ -2,12 +2,12 @@
 Async HTTP client for the broker platform user-gateway.
 
 Handles:
-  * register-on-first-run (POST /users/register) → JWT
-  * login (POST /users/login)                    → JWT
+  * register-on-first-run (POST /users/register) -> JWT
+  * login (POST /users/login)                    -> JWT
   * automatic Authorization header on every request
   * one re-login retry on 401
-  * helpers for the endpoints the bot uses on Day 1 (accounts, funds,
-    portfolio, market snapshot). Day 2 will add /orders.
+  * helpers for the endpoints the bot uses: accounts, funds, portfolio,
+    market snapshot, orders.
 """
 from __future__ import annotations
 
@@ -45,13 +45,11 @@ class HttpClient:
 
     # ----------------------------------------------------------------------- auth
     async def authenticate(self) -> str:
-        """Log in; if the account does not exist, register first. Returns JWT."""
         try:
             self._token = await self._login()
             log.info("auth.login.ok", email=self._settings.bot_email)
             return self._token
         except httpx.HTTPStatusError as exc:
-            # 400/401/404 from login → assume the bot account doesn't exist yet
             if exc.response.status_code in (400, 401, 403, 404):
                 log.info("auth.login.miss_register", status=exc.response.status_code)
                 self._token = await self._register()
@@ -86,9 +84,7 @@ class HttpClient:
             },
         )
         if r.status_code >= 400:
-            raise AuthError(
-                f"Register failed with HTTP {r.status_code}: {r.text}"
-            )
+            raise AuthError(f"Register failed with HTTP {r.status_code}: {r.text}")
         return r.json()["token"]
 
     # -------------------------------------------------------------- core helpers
@@ -102,8 +98,6 @@ class HttpClient:
     ) -> httpx.Response:
         headers = self._auth_headers()
         r = await self._client.request(method, path, json=json, params=params, headers=headers)
-
-        # Re-login once on 401 (token expired / rotated)
         if r.status_code == 401 and self._token is not None:
             log.warning("http.401.relogin", path=path)
             self._token = None
@@ -125,11 +119,8 @@ class HttpClient:
         return r.json()
 
     async def deposit(self, currency: str, amount: Decimal) -> dict[str, Any]:
-        r = await self._request(
-            "POST",
-            "/funds/deposit",
-            json={"currency": currency, "amount": str(amount)},
-        )
+        r = await self._request("POST", "/funds/deposit",
+                                json={"currency": currency, "amount": str(amount)})
         r.raise_for_status()
         return r.json()
 
@@ -138,12 +129,25 @@ class HttpClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_portfolio_ticker_qty(self, ticker: str) -> int:
+        """Held quantity for one ticker (0 if not held). Used by reconcile-then-retry."""
+        try:
+            holdings = await self.get_portfolio()
+        except Exception:  # noqa: BLE001
+            return 0
+        for h in holdings:
+            t = h.get("instrumentId") or h.get("ticker")
+            if t == ticker:
+                try:
+                    return int(h.get("amount") or h.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
     async def get_market_snapshot(self) -> list[dict[str, Any]]:
-        """Initial /market/stocks snapshot via the gateway's /exchange proxy."""
         r = await self._request("GET", "/exchange/market/stocks")
         r.raise_for_status()
         data = r.json()
-        # The exchange may return a bare list or {stocks: [...]} — handle both.
         if isinstance(data, list):
             return data
         for key in ("stocks", "data", "items"):
@@ -186,19 +190,3 @@ class HttpClient:
     async def cancel_order(self, order_id: str | int) -> None:
         r = await self._request("DELETE", f"/orders/{order_id}")
         r.raise_for_status()
-
-    async def get_portfolio_ticker_qty(self, ticker: str) -> int:
-        """Return the current held quantity for ticker from GET /portfolio, or 0.
-
-        Used by the executor's reconcile-then-retry path to check whether a
-        timed-out order actually landed before deciding to retry.
-        """
-        try:
-            holdings = await self.get_portfolio()
-            for h in holdings:
-                t = h.get("instrumentId") or h.get("ticker")
-                if t == ticker:
-                    return int(h.get("amount") or h.get("quantity") or 0)
-        except Exception:  # noqa: BLE001
-            pass
-        return 0

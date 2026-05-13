@@ -57,39 +57,18 @@ class Executor:
                 limit_price=intent.limit_price,
             )
         except httpx.TimeoutException:
-            log.warning(
-                "exec.timeout",
-                ticker=intent.ticker,
-                side=intent.side,
-                qty=intent.quantity,
-            )
+            log.warning("exec.timeout", ticker=intent.ticker, side=intent.side, qty=intent.quantity)
             return await self._reconcile_then_retry(intent)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code >= 500:
-                log.warning(
-                    "exec.5xx",
-                    ticker=intent.ticker,
-                    status=exc.response.status_code,
-                )
+                log.warning("exec.5xx", ticker=intent.ticker, status=exc.response.status_code)
                 return await self._reconcile_then_retry(intent)
-            log.error(
-                "exec.place_failed",
-                ticker=intent.ticker,
-                side=intent.side,
-                qty=intent.quantity,
-                reason=intent.reason,
-                error=str(exc),
-            )
+            log.error("exec.place_failed", ticker=intent.ticker, side=intent.side,
+                      qty=intent.quantity, reason=intent.reason, error=str(exc))
             return None
         except Exception as exc:  # noqa: BLE001
-            log.error(
-                "exec.place_failed",
-                ticker=intent.ticker,
-                side=intent.side,
-                qty=intent.quantity,
-                reason=intent.reason,
-                error=str(exc),
-            )
+            log.error("exec.place_failed", ticker=intent.ticker, side=intent.side,
+                      qty=intent.quantity, reason=intent.reason, error=str(exc))
             return None
 
         return self._register_placed(intent, resp)
@@ -144,15 +123,10 @@ class Executor:
             raw=resp,
         )
         self.open_orders[order_id] = oo
-        log.info(
-            "exec.placed",
-            order_id=order_id,
-            ticker=intent.ticker,
-            side=intent.side,
-            qty=intent.quantity,
-            limit=str(intent.limit_price) if intent.limit_price else None,
-            reason=intent.reason,
-        )
+        log.info("exec.placed", order_id=order_id, ticker=intent.ticker,
+                 side=intent.side, qty=intent.quantity,
+                 limit=str(intent.limit_price) if intent.limit_price else None,
+                 reason=intent.reason)
         return oo
 
     async def _reconcile_then_retry(self, intent: OrderIntent) -> OpenOrder | None:
@@ -160,28 +134,17 @@ class Executor:
         await asyncio.sleep(1.0)
 
         held_qty = await self.http.get_portfolio_ticker_qty(intent.ticker)
-
-        # Did the order appear to land already?
         order_appears_placed = (
             (intent.side == "BUY" and held_qty > 0)
             or (intent.side == "SELL" and held_qty == 0)
         )
 
         if order_appears_placed:
-            log.info(
-                "exec.reconcile.confirmed_placed",
-                ticker=intent.ticker,
-                side=intent.side,
-                held_qty=held_qty,
-            )
-            # Portfolio reconcile loop will pick up the position update.
+            log.info("exec.reconcile.confirmed_placed", ticker=intent.ticker,
+                     side=intent.side, held_qty=held_qty)
             return None
 
-        log.info(
-            "exec.reconcile.retrying",
-            ticker=intent.ticker,
-            side=intent.side,
-        )
+        log.info("exec.reconcile.retrying", ticker=intent.ticker, side=intent.side)
         try:
             resp = await self.http.place_order(
                 instrument_type="STOCK",
@@ -192,13 +155,7 @@ class Executor:
                 limit_price=intent.limit_price,
             )
         except Exception as exc:  # noqa: BLE001
-            log.error(
-                "exec.retry.failed",
-                ticker=intent.ticker,
-                side=intent.side,
-                error=str(exc),
-            )
+            log.error("exec.retry.failed", ticker=intent.ticker, side=intent.side, error=str(exc))
             return None
 
         return self._register_placed(intent, resp)
-

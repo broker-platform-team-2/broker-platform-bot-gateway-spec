@@ -4,12 +4,13 @@ Decision engine.
 Inputs:  current MarketStore + current Portfolio + cash balance
 Outputs: a list of OrderIntent objects (BUY / SELL with quantity)
 
-The strategy is the "concentrated aggressive momentum" plan from the docx:
+The strategy is the "concentrated aggressive momentum" plan:
   * scan all tickers, score by momentum_score
-  * keep the top 5 above a dynamic threshold (the median of all positive scores)
+  * keep the top 5 with positive score
   * for each held position, manage a trailing stop and a hard stop
   * for each new top-5 ticker we do NOT yet hold, emit a BUY intent sized
-    to 15% of current equity (Day 2 entry rule; pyramid lands Day 3)
+    to 15% of current equity
+  * pyramid into winners that are still scoring high (Track A)
 
 No knobs are exposed. Everything is hard-coded with sensible defaults.
 """
@@ -17,7 +18,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Iterable
 
 import numpy as np
 
@@ -38,7 +38,7 @@ class OrderIntent:
     quantity: int
     order_type: str         # "LIMIT" | "MARKET"
     limit_price: Decimal | None = None
-    reason: str = ""        # for logging: "entry", "trailing_stop", "hard_stop", "exit_watchlist"
+    reason: str = ""
 
 
 @dataclass
@@ -46,7 +46,7 @@ class Position:
     ticker: str
     quantity: int
     avg_cost: Decimal
-    peak_price: Decimal     # highest price seen since entry — drives trailing stop
+    peak_price: Decimal
 
 
 @dataclass
@@ -65,13 +65,14 @@ class PortfolioView:
 
 # ---------------------------------------------------------------------- constants
 
-# Hard-coded defaults — the bot self-tunes nothing the user touches.
 WATCHLIST_SIZE = 5
-ENTRY_FRACTION = Decimal("0.15")     # 15% of equity on first entry
-ATR_STOP_MULTIPLIER = 2.0            # trailing stop = peak - 2.0 * ATR
-HARD_STOP_PCT = Decimal("-0.03")     # -3% from average cost
-MIN_PRICES_FOR_SCORING = 31          # need ~30 closes for ATR/breakout/volume_surge
-MIN_TICKERS_FOR_ENTRY = 5            # don't try to enter before we have 5+ candidates
+ENTRY_FRACTION = Decimal("0.15")
+PYRAMID_FRACTION = Decimal("0.10")
+PYRAMID_TRIGGER_PCT = Decimal("0.02")
+ATR_STOP_MULTIPLIER = 2.0
+HARD_STOP_PCT = Decimal("-0.03")
+MIN_PRICES_FOR_SCORING = 31
+MIN_TICKERS_FOR_ENTRY = 5
 
 
 # ------------------------------------------------------------------- core function
@@ -80,33 +81,23 @@ class Strategy:
     """One strategy, executed well. Stateless between ticks except for caches."""
 
     def __init__(self) -> None:
-        # Caches the last computed score per ticker for debugging / logging
         self._last_scores: dict[str, float] = {}
 
-    def decide(
-        self,
-        market: MarketStore,
-        portfolio: PortfolioView,
-    ) -> list[OrderIntent]:
-        """Run one tick of the decision pipeline. Returns intents to act on."""
+    def decide(self, market: MarketStore, portfolio: PortfolioView) -> list[OrderIntent]:
         intents: list[OrderIntent] = []
 
-        # 1. Score everything that has enough data.
         scores = self._score_all(market)
         self._last_scores = scores
 
-        # 2. Pick the top-N watchlist among positive scores.
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         positive = [(t, s) for t, s in ranked if s > 0]
         watchlist = {t for t, _ in positive[:WATCHLIST_SIZE]}
 
-        # 3. Manage existing positions first (exits take priority over entries).
         for ticker, pos in list(portfolio.positions.items()):
             exit_intent = self._exit_decision(ticker, pos, market, in_watchlist=ticker in watchlist)
             if exit_intent:
                 intents.append(exit_intent)
 
-        # 4. For each watchlist ticker we don't already hold, emit an entry.
         if len(scores) >= MIN_TICKERS_FOR_ENTRY:
             equity = portfolio.equity(market)
             for ticker in watchlist:
@@ -119,6 +110,46 @@ class Strategy:
                 if entry is not None:
                     intents.append(entry)
 
+            pyramid_intents = self.propose_pyramid(market, portfolio, watchlist)
+            intents.extend(pyramid_intents)
+
+        return intents
+
+    def propose_pyramid(
+        self,
+        market: MarketStore,
+        portfolio: PortfolioView,
+        watchlist: set[str],
+    ) -> list[OrderIntent]:
+        """Add to winners that are still in the top-N and up >=2% from cost."""
+        intents: list[OrderIntent] = []
+        equity = portfolio.equity(market)
+        cash = portfolio.cash
+        for ticker, pos in portfolio.positions.items():
+            if ticker not in watchlist:
+                continue
+            state = market.get(ticker)
+            if state is None or state.price <= 0:
+                continue
+            price = Decimal(str(state.price))
+            trigger = pos.avg_cost * (Decimal("1") + PYRAMID_TRIGGER_PCT)
+            if price < trigger:
+                continue
+            notional = min(equity * PYRAMID_FRACTION, cash)
+            if notional <= 0:
+                continue
+            qty = int(notional / price)
+            if qty <= 0:
+                continue
+            limit_price = (price * Decimal("1.001")).quantize(Decimal("0.01"))
+            intents.append(OrderIntent(
+                side="BUY",
+                ticker=ticker,
+                quantity=qty,
+                order_type="LIMIT",
+                limit_price=limit_price,
+                reason="pyramid",
+            ))
         return intents
 
     # ----------------------------------------------------------------- internals
@@ -130,12 +161,15 @@ class Strategy:
             if state is None or len(state.recent) < MIN_PRICES_FOR_SCORING:
                 continue
             closes = np.array(state.recent, dtype=np.float64)
-            # We don't get per-tick volume in PRICE_UPDATE in a vector form;
-            # we approximate "volume series" by repeating the latest volume.
-            # The volume_surge component will be ~1.0 (neutral), so the score
-            # is driven by rate_of_change + breakout_strength. That's fine for
-            # MVP — Day 3 we replace this with proper per-tick volume tracking.
-            volumes = np.full_like(closes, state.volume, dtype=np.float64)
+            if len(state.volumes) == len(state.recent):
+                volumes = np.array(state.volumes, dtype=np.float64)
+            else:
+                pad = state.volumes[0] if state.volumes else state.volume
+                volumes = np.array(
+                    [pad] * (len(state.recent) - len(state.volumes))
+                    + list(state.volumes),
+                    dtype=np.float64,
+                )
             score = indicators.momentum_score(closes, volumes)
             if score is not None:
                 scores[ticker] = score
@@ -148,15 +182,12 @@ class Strategy:
         cash: Decimal,
     ) -> OrderIntent | None:
         price = Decimal(str(state.price))
-        notional = equity * ENTRY_FRACTION
-        # Don't try to spend more cash than we have.
-        notional = min(notional, cash)
+        notional = min(equity * ENTRY_FRACTION, cash)
         if notional <= 0:
             return None
         qty = int(notional / price)
         if qty <= 0:
             return None
-        # LIMIT one tick above current price — we want fills, not bargains.
         limit_price = (price * Decimal("1.001")).quantize(Decimal("0.01"))
         return OrderIntent(
             side="BUY",
@@ -180,11 +211,9 @@ class Strategy:
             return None
         price = Decimal(str(state.price))
 
-        # Update peak as we go (caller persists Position objects across ticks).
         if price > pos.peak_price:
             pos.peak_price = price
 
-        # Hard stop: -3% from average cost.
         hard_stop = pos.avg_cost * (Decimal("1") + HARD_STOP_PCT)
         if price <= hard_stop:
             return OrderIntent(
@@ -192,7 +221,6 @@ class Strategy:
                 order_type="MARKET", reason="hard_stop",
             )
 
-        # Trailing stop: peak - 2.0 * ATR.
         closes = np.array(state.recent, dtype=np.float64)
         atr = indicators.atr_proxy(closes, length=14)
         if atr is not None and atr > 0:
@@ -203,12 +231,10 @@ class Strategy:
                     order_type="MARKET", reason="trailing_stop",
                 )
 
-        # Universe rotation: if a held ticker drops out of the watchlist, exit it.
-        # (Frees capital for the new top-N.)
         if not in_watchlist:
             return OrderIntent(
                 side="SELL", ticker=ticker, quantity=pos.quantity,
                 order_type="MARKET", reason="exit_watchlist",
             )
 
-        return None  # hold
+        return None
