@@ -3,11 +3,17 @@ The orchestrator.
 
 Day 2 wires the full pipeline:
 
-    PRICE_UPDATE  →  strategy.decide()  →  risk.filter()  →  executor.submit_all()
-    ORDER_UPDATE  →  executor.handle_order_update()  +  refresh portfolio
-    every 30 s    →  reconcile portfolio + cash from /portfolio + /accounts/me
+    PRICE_UPDATE  ->  strategy.decide()  ->  risk.filter()  ->  executor.submit_all()
+    ORDER_UPDATE  ->  executor.handle_order_update()  +  refresh portfolio
+    every 30 s    ->  reconcile portfolio + cash from /portfolio + /accounts/me
 
 Day 3 will hook events.MARKET_EVENT and pyramiding in here too.
+
+Track B additions:
+  - ORDER_BOOK_UPDATE is now forwarded to an OrderBook cache; strategy uses
+    real best-ask prices for LIMIT entries when book data is available.
+  - When REPLAY_RECORD=1, a RunRecorder is attached to WsClient so every
+    incoming message is written to runs/<timestamp>.jsonl for later replay.
 """
 from __future__ import annotations
 
@@ -22,6 +28,8 @@ from .executor import Executor
 from .http_client import HttpClient
 from .logging_setup import configure as configure_logging, get_logger
 from .market import MarketStore
+from .orderbook import OrderBook
+from .replay import open_run_file, recording_enabled
 from .risk import RiskGate
 from .strategy import PortfolioView, Position, Strategy
 from .ws_client import WsClient
@@ -40,6 +48,7 @@ class Bot:
         self.settings = settings
         self.http = HttpClient(settings)
         self.market = MarketStore()
+        self.orderbook = OrderBook()
         self.ws = WsClient(settings, get_token=lambda: self.http.token)
         self.strategy = Strategy()
         self.risk = RiskGate()
@@ -94,7 +103,7 @@ class Bot:
             log.warning("market.snapshot.failed", error=str(exc))
 
     async def _reconcile_portfolio(self) -> None:
-        """Pull cash + positions from the platform — source of truth."""
+        """Pull cash + positions from the platform - source of truth."""
         try:
             accounts = await self.http.get_accounts()
             holdings = await self.http.get_portfolio()
@@ -164,7 +173,7 @@ class Bot:
             await self._run_decision_cycle()
 
     async def _run_decision_cycle(self) -> None:
-        intents = self.strategy.decide(self.market, self.portfolio)
+        intents = self.strategy.decide(self.market, self.portfolio, self.orderbook)
         if not intents:
             return
         allowed = self.risk.filter(intents, self.portfolio, self.market)
@@ -220,7 +229,8 @@ class Bot:
         await self.executor.submit_all(allowed)
 
     async def _on_order_book_update(self, payload: dict[str, Any]) -> None:
-        log.debug("orderbook", **payload)
+        self.orderbook.apply_update(payload)
+        log.debug("orderbook.updated", ticker=payload.get("ticker") or payload.get("symbol"))
 
     # ---------------------------------------------------------------- run loop
     async def run(self) -> None:
@@ -231,6 +241,14 @@ class Bot:
             email=self.settings.bot_email,
         )
         await self.bootstrap()
+
+        if recording_enabled():
+            recorder = open_run_file()
+            self.ws.set_recorder(recorder)
+            log.info("replay.recording", path=str(recorder.path))
+        else:
+            recorder = None
+
         await self.ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
 
@@ -240,7 +258,7 @@ class Bot:
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except NotImplementedError:
-                # Windows asyncio doesn't support add_signal_handler — KeyboardInterrupt
+                # Windows asyncio doesn't support add_signal_handler - KeyboardInterrupt
                 # bubbles up naturally there.
                 pass
 
@@ -258,6 +276,9 @@ class Bot:
                     pass
             await self.ws.stop()
             await self.http.aclose()
+            if recorder is not None:
+                recorder.close()
+                log.info("replay.recorded", path=str(recorder.path))
             log.info("bot.stopped")
 
 
@@ -269,3 +290,9 @@ async def main() -> None:
         await bot.run()
     except KeyboardInterrupt:
         pass
+
+
+def replay_main(jsonl_path: str) -> None:
+    """Entry point for `python -m bot replay <file>`."""
+    from .replay import replay
+    replay(jsonl_path)
