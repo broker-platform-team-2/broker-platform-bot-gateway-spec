@@ -96,6 +96,10 @@ PYRAMID_TRIGGER_PCT  = Decimal("0.02")
 
 # Exit thresholds
 EXIT_SCORE_THRESHOLD   = -0.01             # sell only when momentum clearly negative
+EXIT_SCORE_CONFIRM     = 3                 # score must stay below threshold for this many
+                                           # consecutive cycles before a score_exit fires
+                                           # (~4-5 s at normal tick rate) — avoids selling
+                                           # on brief dips
 HARD_STOP_ATR_MULT     = Decimal("2.5")    # hard stop = avg_cost - 2.5 × entry_atr
 HARD_STOP_PCT_FALLBACK = Decimal("-0.03")  # fallback when entry_atr == 0
 TRAILING_ATR_MULT      = 3.0              # wider trailing: 3× current ATR
@@ -129,6 +133,7 @@ class Strategy:
     def __init__(self) -> None:
         self._last_scores: dict[str, float] = {}
         self._flat_decision_cycles: int = 0   # consecutive cycles with no position & no entry
+        self._exit_confirm: dict[str, int] = {}  # consecutive below-threshold cycles per ticker
 
     # ----------------------------------------------------------------- public
 
@@ -438,15 +443,23 @@ class Strategy:
                 )
 
         # 3. Score threshold exit — momentum has flipped or dried up.
+        #    Require EXIT_SCORE_CONFIRM consecutive below-threshold cycles before
+        #    selling so brief dips don't trigger an immediate exit.
         score = self._last_scores.get(ticker, 0.0)
         if score < EXIT_SCORE_THRESHOLD:
-            return OrderIntent(
-                side="SELL",
-                ticker=ticker,
-                quantity=pos.quantity,
-                order_type="MARKET",
-                reason="score_exit",
-            )
+            count = self._exit_confirm.get(ticker, 0) + 1
+            self._exit_confirm[ticker] = count
+            if count >= EXIT_SCORE_CONFIRM:
+                self._exit_confirm.pop(ticker)
+                return OrderIntent(
+                    side="SELL",
+                    ticker=ticker,
+                    quantity=pos.quantity,
+                    order_type="MARKET",
+                    reason="score_exit",
+                )
+        else:
+            self._exit_confirm.pop(ticker, None)  # score recovered — reset counter
 
         return None
 

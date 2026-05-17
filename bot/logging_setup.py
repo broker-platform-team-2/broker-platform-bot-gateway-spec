@@ -17,6 +17,10 @@ def configure(level: str = "INFO") -> None:
         stream=sys.stdout,
         level=getattr(logging, level.upper(), logging.INFO),
     )
+    # httpx/httpcore log every request at INFO — silence them so they don't
+    # drown out the bot's own structured logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     structlog.configure(
         processors=[

@@ -8,6 +8,7 @@ executor places it. Hard caps (never configurable):
   * Max total exposure:         95% of equity
   * Max notional per order:     10% of equity
   * Per-sector exposure:        35% of equity
+  * Max quantity per order:     281             (applies to both BUY and SELL)
   * Per-minute order count:     25              (exchange limit is 30)
   * Drawdown-proportional size: 4-band scaling
       0% to -5%    -> 1.0x  (full size)
@@ -48,6 +49,7 @@ MAX_TOTAL_EXPOSURE     = Decimal("0.95")
 MAX_ORDER_NOTIONAL     = Decimal("0.10")
 MAX_SECTOR_EXPOSURE    = Decimal("0.35")   # per-sector cap
 ORDERS_PER_MINUTE      = 25
+MAX_ORDER_QUANTITY     = 281
 
 # Drawdown bands — thresholds and corresponding BUY size multipliers
 DRAWDOWN_KILL_SWITCH   = Decimal("-0.15")  # below this -> pause then 0.10x recovery
@@ -71,6 +73,7 @@ class RiskState:
     paused_until_tick: int = 0
     current_tick: int = 0
     order_timestamps: deque[float] = field(default_factory=lambda: deque(maxlen=200))
+    kill_switch_active: bool = False  # True while drawdown is below the kill-switch threshold
 
     def tick(self, equity: Decimal) -> None:
         self.current_tick += 1
@@ -117,11 +120,19 @@ class RiskGate:
         return SIZE_MULT_FULL          # 0%   to -5%  -> 1.00x
 
     def maybe_trigger_kill_switch(self, equity: Decimal) -> None:
-        if self.drawdown(equity) <= DRAWDOWN_KILL_SWITCH and not self.trading_paused():
+        dd = self.drawdown(equity)
+        if dd > DRAWDOWN_KILL_SWITCH:
+            # Equity has recovered above the threshold — allow the kill switch
+            # to fire again if we breach it in the future.
+            self.state.kill_switch_active = False
+            return
+        if not self.state.kill_switch_active:
+            # First breach (or re-breach after recovery) — fire once and hold.
+            self.state.kill_switch_active = True
             self.state.paused_until_tick = self.state.current_tick + KILL_SWITCH_PAUSE_TICKS
             log.warning(
                 "risk.kill_switch",
-                drawdown=str(self.drawdown(equity)),
+                drawdown=str(dd),
                 paused_for_ticks=KILL_SWITCH_PAUSE_TICKS,
                 resume_at_mult=str(SIZE_MULT_RECOVERY),
                 note="after pause resumes at 0.10x recovery mode, not frozen",
@@ -159,6 +170,19 @@ class RiskGate:
 
             # --- SELLs always pass (we never block an exit)
             if intent.side == "SELL":
+                if intent.quantity > MAX_ORDER_QUANTITY:
+                    log.info(
+                        "risk.cap.quantity.sell_clamped",
+                        ticker=intent.ticker,
+                        original=intent.quantity,
+                        clamped=MAX_ORDER_QUANTITY,
+                    )
+                    intent = OrderIntent(
+                        side=intent.side, ticker=intent.ticker,
+                        quantity=MAX_ORDER_QUANTITY, order_type=intent.order_type,
+                        limit_price=intent.limit_price, reason=intent.reason,
+                        entry_atr=intent.entry_atr,
+                    )
                 if self._under_rate_limit():
                     allowed.append(intent)
                     self._record_order()
@@ -167,6 +191,20 @@ class RiskGate:
                 continue
 
             # --- BUYs: apply all caps then drawdown scaling
+
+            if intent.quantity > MAX_ORDER_QUANTITY:
+                log.info(
+                    "risk.cap.quantity.buy_clamped",
+                    ticker=intent.ticker,
+                    original=intent.quantity,
+                    clamped=MAX_ORDER_QUANTITY,
+                )
+                intent = OrderIntent(
+                    side=intent.side, ticker=intent.ticker,
+                    quantity=MAX_ORDER_QUANTITY, order_type=intent.order_type,
+                    limit_price=intent.limit_price, reason=intent.reason,
+                    entry_atr=intent.entry_atr,
+                )
 
             if not self._under_rate_limit():
                 log.warning("risk.rate_limit.entry_dropped", ticker=intent.ticker)

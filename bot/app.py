@@ -178,8 +178,11 @@ class Bot:
     async def _reconcile_loop(self) -> None:
         while True:
             await asyncio.sleep(30.0)
-            for sub in await self.http.get_active_subscribers():
-                await self._reconcile_subscriber(sub["userId"])
+            try:
+                for sub in await self.http.get_active_subscribers():
+                    await self._reconcile_subscriber(sub["userId"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("reconcile.loop.error", error=str(exc))
 
     # ----------------------------------------------------------------- handlers
 
@@ -226,12 +229,31 @@ class Bot:
             for ticker, pos in portfolio.positions.items():
                 peaks[ticker] = pos.peak_price
 
-            if not intents:
-                continue
-
-            risk    = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+            risk = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+            # Always call filter() even when intents is empty.
+            # filter() calls update_for_tick() which advances the kill-switch
+            # pause countdown. If we skip it whenever intents is empty (e.g.
+            # after all positions are stopped out and momentum is negative),
+            # the 30-tick pause counter freezes and the bot never resumes.
             allowed = risk.filter(intents, portfolio, self.market)
+
+            if not intents:
+                log.debug(
+                    "bot.idle",
+                    user_id=user_id,
+                    reason="no_intents",
+                    positions=len(portfolio.positions),
+                    equity=str(portfolio.equity(self.market)),
+                )
+                continue
             if not allowed:
+                log.debug(
+                    "bot.idle",
+                    user_id=user_id,
+                    reason="all_filtered_by_risk",
+                    proposed=len(intents),
+                    equity=str(portfolio.equity(self.market)),
+                )
                 continue
 
             log.info(

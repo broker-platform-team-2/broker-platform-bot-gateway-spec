@@ -11,6 +11,7 @@ Handles:
 """
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import Any
 
@@ -30,6 +31,7 @@ class HttpClient:
     def __init__(self, settings: Settings, *, timeout: float = 10.0) -> None:
         self._settings = settings
         self._token: str | None = None
+        self._auth_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             base_url=settings.gateway_http_url,
             timeout=timeout,
@@ -99,13 +101,32 @@ class HttpClient:
     ) -> httpx.Response:
         headers = {**self._auth_headers(), **(extra_headers or {})}
         r = await self._client.request(method, path, json=json, params=params, headers=headers)
-        if r.status_code == 401 and self._token is not None:
+        if r.status_code == 401:
             log.warning("http.401.relogin", path=path)
-            self._token = None
-            await self.authenticate()
-            headers = {**self._auth_headers(), **(extra_headers or {})}
-            r = await self._client.request(method, path, json=json, params=params, headers=headers)
+            self._token = None  # signal that any concurrent waiter should re-auth too
+            await self._reauth()
+            if self._token:  # only retry if re-auth succeeded
+                headers = {**self._auth_headers(), **(extra_headers or {})}
+                r = await self._client.request(method, path, json=json, params=params, headers=headers)
         return r
+
+    async def _reauth(self) -> None:
+        """Re-authenticate, serialising concurrent callers under a lock.
+
+        If another coroutine already refreshed the token while this one waited
+        for the lock, the refresh is skipped (the new token will be used on
+        retry).  If authenticate() itself fails the error is logged but NOT
+        re-raised so callers receive the original 401 response and their own
+        error-handling (broad except / raise_for_status) decides what to do —
+        the bot will retry on the next tick rather than freezing permanently.
+        """
+        async with self._auth_lock:
+            if self._token:
+                return  # refreshed by a concurrent coroutine while we waited
+            try:
+                await self.authenticate()
+            except Exception as exc:  # noqa: BLE001
+                log.error("http.reauth.failed", error=str(exc))
 
     def _auth_headers(self) -> dict[str, str]:
         if not self._token:
