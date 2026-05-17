@@ -1,16 +1,31 @@
 """
-Risk gate.
+Risk gate — v2.
 
 Every OrderIntent the strategy emits is filtered through here BEFORE the
-executor places it. Caps that cannot be turned off in live mode:
+executor places it. Hard caps (never configurable):
 
-  * Max position per ticker:    25% of equity   (hard ceiling on concentration)
-  * Max total exposure:         95% of equity   (keep a little cash for fills)
-  * Max notional per order:     10% of equity   (no fat-finger trades)
-  * Per-minute order count:     25              (well under exchange's 30 limit)
-  * Daily drawdown kill-switch: -15% from session peak (pauses 30 ticks, then half-size)
+  * Max position per ticker:    25% of equity
+  * Max total exposure:         95% of equity
+  * Max notional per order:     10% of equity
+  * Per-sector exposure:        35% of equity
+  * Per-minute order count:     25              (exchange limit is 30)
+  * Drawdown-proportional size: 4-band scaling
+      0% to -5%    -> 1.0x  (full size)
+      -5% to -10%  -> 0.65x (reduced)
+      -10% to -15% -> 0.35x (survival mode)
+      below -15%   -> 0.10x (recovery mode — tiny buys to dig out)
+                             + 30-tick trading PAUSE on first breach
 
-None of these are exposed to the user. They're hard-coded defaults.
+Kill-switch design (v2 fix):
+  The old implementation returned 0x below -15%, which caused the bot to
+  freeze permanently once all positions were closed: no buys possible,
+  nothing to sell -> completely idle.
+
+  The fix: after the 30-tick pause the bot resumes at 0.10x (recovery mode)
+  so it can make small entries and work its way back.  The pause still
+  provides the "stop and assess" moment; 0.10x means any single buy
+  deploys at most 1% of equity (10% fraction x 0.10 multiplier), limiting
+  further damage while allowing recovery.
 """
 from __future__ import annotations
 
@@ -28,15 +43,27 @@ log = get_logger(__name__)
 
 # --------------------------------------------------------------------- constants
 
-MAX_POSITION_FRACTION = Decimal("0.25")
-MAX_TOTAL_EXPOSURE = Decimal("0.95")
-MAX_ORDER_NOTIONAL = Decimal("0.10")
-ORDERS_PER_MINUTE = 25
-DRAWDOWN_KILL_SWITCH = Decimal("-0.15")
+MAX_POSITION_FRACTION  = Decimal("0.25")
+MAX_TOTAL_EXPOSURE     = Decimal("0.95")
+MAX_ORDER_NOTIONAL     = Decimal("0.10")
+MAX_SECTOR_EXPOSURE    = Decimal("0.35")   # per-sector cap
+ORDERS_PER_MINUTE      = 25
+
+# Drawdown bands — thresholds and corresponding BUY size multipliers
+DRAWDOWN_KILL_SWITCH   = Decimal("-0.15")  # below this -> pause then 0.10x recovery
+DRAWDOWN_BAND_MEDIUM   = Decimal("-0.10")  # -10% to -15% -> 0.35x
+DRAWDOWN_BAND_LIGHT    = Decimal("-0.05")  # -5%  to -10% -> 0.65x
+SIZE_MULT_FULL         = Decimal("1.00")
+SIZE_MULT_LIGHT        = Decimal("0.65")
+SIZE_MULT_MEDIUM       = Decimal("0.35")
+SIZE_MULT_RECOVERY     = Decimal("0.10")   # post-kill-switch recovery mode
+
+# After kill-switch fires, trading is completely paused for this many ticks.
+# Once the pause expires the bot resumes at SIZE_MULT_RECOVERY (not 0x).
 KILL_SWITCH_PAUSE_TICKS = 30
 
 
-# ---------------------------------------------------------------------- gate
+# ---------------------------------------------------------------------- state
 
 @dataclass
 class RiskState:
@@ -51,11 +78,14 @@ class RiskState:
             self.session_peak_equity = equity
 
 
+# ---------------------------------------------------------------------- gate
+
 class RiskGate:
     def __init__(self) -> None:
         self.state = RiskState()
 
     # ----------------------------------------------------------------- session
+
     def update_for_tick(self, equity: Decimal) -> None:
         self.state.tick(equity)
 
@@ -68,6 +98,24 @@ class RiskGate:
     def trading_paused(self) -> bool:
         return self.state.current_tick < self.state.paused_until_tick
 
+    def _size_multiplier(self, equity: Decimal) -> Decimal:
+        """Return the BUY quantity multiplier based on current drawdown band.
+
+        Below DRAWDOWN_KILL_SWITCH the bot enters recovery mode (0.10x) rather
+        than a hard 0x block.  The initial pause (KILL_SWITCH_PAUSE_TICKS) is
+        enforced separately by trading_paused() / maybe_trigger_kill_switch().
+        After the pause expires the bot can make tiny recovery entries so it
+        isn't permanently frozen when flat and deep in drawdown.
+        """
+        dd = self.drawdown(equity)
+        if dd <= DRAWDOWN_KILL_SWITCH:
+            return SIZE_MULT_RECOVERY  # 0.10x — tiny recovery buys only
+        if dd <= DRAWDOWN_BAND_MEDIUM:
+            return SIZE_MULT_MEDIUM    # -10% to -15% -> 0.35x
+        if dd <= DRAWDOWN_BAND_LIGHT:
+            return SIZE_MULT_LIGHT     # -5%  to -10% -> 0.65x
+        return SIZE_MULT_FULL          # 0%   to -5%  -> 1.00x
+
     def maybe_trigger_kill_switch(self, equity: Decimal) -> None:
         if self.drawdown(equity) <= DRAWDOWN_KILL_SWITCH and not self.trading_paused():
             self.state.paused_until_tick = self.state.current_tick + KILL_SWITCH_PAUSE_TICKS
@@ -75,9 +123,12 @@ class RiskGate:
                 "risk.kill_switch",
                 drawdown=str(self.drawdown(equity)),
                 paused_for_ticks=KILL_SWITCH_PAUSE_TICKS,
+                resume_at_mult=str(SIZE_MULT_RECOVERY),
+                note="after pause resumes at 0.10x recovery mode, not frozen",
             )
 
     # ----------------------------------------------------------------- filter
+
     def filter(
         self,
         intents: list[OrderIntent],
@@ -89,16 +140,25 @@ class RiskGate:
         self.maybe_trigger_kill_switch(equity)
 
         if self.trading_paused():
-            # Only allow SELLs while paused — never new BUYs.
+            # Kill switch active — only exits are permitted
             sells = [i for i in intents if i.side == "SELL"]
             if sells:
                 log.info("risk.paused.allow_sells_only", count=len(sells))
             return sells
 
+        size_mult = self._size_multiplier(equity)
+        if size_mult < SIZE_MULT_FULL:
+            log.info(
+                "risk.drawdown_scaling",
+                drawdown=str(self.drawdown(equity)),
+                multiplier=str(size_mult),
+            )
+
         allowed: list[OrderIntent] = []
         for intent in intents:
+
+            # --- SELLs always pass (we never block an exit)
             if intent.side == "SELL":
-                # Sells always pass the gate (we never block an exit).
                 if self._under_rate_limit():
                     allowed.append(intent)
                     self._record_order()
@@ -106,7 +166,8 @@ class RiskGate:
                     log.warning("risk.rate_limit.exit_dropped", ticker=intent.ticker)
                 continue
 
-            # BUY: check caps.
+            # --- BUYs: apply all caps then drawdown scaling
+
             if not self._under_rate_limit():
                 log.warning("risk.rate_limit.entry_dropped", ticker=intent.ticker)
                 continue
@@ -115,6 +176,8 @@ class RiskGate:
                 str(market.get(intent.ticker).price if market.get(intent.ticker) else 0)
             )
             notional = price * intent.quantity
+
+            # Order notional cap
             if notional > equity * MAX_ORDER_NOTIONAL:
                 log.warning(
                     "risk.cap.order_notional",
@@ -124,36 +187,84 @@ class RiskGate:
                 )
                 continue
 
-            # Per-ticker position cap (including this proposed buy).
-            existing = portfolio.positions.get(intent.ticker)
-            new_qty = (existing.quantity if existing else 0) + intent.quantity
-            new_position_value = price * new_qty
-            if new_position_value > equity * MAX_POSITION_FRACTION:
+            # Per-ticker position cap
+            existing    = portfolio.positions.get(intent.ticker)
+            new_qty     = (existing.quantity if existing else 0) + intent.quantity
+            new_pos_val = price * new_qty
+            if new_pos_val > equity * MAX_POSITION_FRACTION:
                 log.warning(
                     "risk.cap.position",
                     ticker=intent.ticker,
-                    new_value=str(new_position_value),
+                    new_value=str(new_pos_val),
                     cap=str(equity * MAX_POSITION_FRACTION),
                 )
                 continue
 
-            # Total exposure cap.
+            # Per-sector exposure cap
+            # Prevents over-concentration during SECTOR_BOOM events where
+            # the top-N momentum stocks all happen to be in the same sector.
+            sector_exp = self._sector_exposure(intent.ticker, portfolio, market)
+            if sector_exp + notional > equity * MAX_SECTOR_EXPOSURE:
+                log.info(
+                    "risk.cap.sector_exposure",
+                    ticker=intent.ticker,
+                    sector_exposure=str(sector_exp),
+                    cap=str(equity * MAX_SECTOR_EXPOSURE),
+                )
+                continue
+
+            # Total exposure cap
             current_exposure = sum(
-                (Decimal(str(market.get(t).price if market.get(t) else 0)) * p.quantity)
+                Decimal(str(market.get(t).price if market.get(t) else 0)) * p.quantity
                 for t, p in portfolio.positions.items()
             )
             if current_exposure + notional > equity * MAX_TOTAL_EXPOSURE:
                 log.info("risk.cap.total_exposure", ticker=intent.ticker)
                 continue
 
+            # Drawdown-proportional quantity scaling
+            if size_mult <= 0:
+                continue  # should be caught by trading_paused, but be safe
+            if size_mult < SIZE_MULT_FULL:
+                scaled_qty = max(1, int(intent.quantity * size_mult))
+                intent = OrderIntent(
+                    side=intent.side,
+                    ticker=intent.ticker,
+                    quantity=scaled_qty,
+                    order_type=intent.order_type,
+                    limit_price=intent.limit_price,
+                    reason=intent.reason,
+                    entry_atr=intent.entry_atr,
+                )
+
             allowed.append(intent)
             self._record_order()
+
         return allowed
 
     # ----------------------------------------------------------------- helpers
+
+    def _sector_exposure(
+        self,
+        ticker: str,
+        portfolio: PortfolioView,
+        market: MarketStore,
+    ) -> Decimal:
+        """Current notional held in the same sector as ticker."""
+        state  = market.get(ticker)
+        sector = (state.sector or "").strip().lower() if state else ""
+        if not sector:
+            return Decimal("0")
+        total = Decimal("0")
+        for t, pos in portfolio.positions.items():
+            ts = market.get(t)
+            if ts and (ts.sector or "").strip().lower() == sector:
+                price = Decimal(str(ts.price)) if ts.price > 0 else pos.avg_cost
+                total += price * pos.quantity
+        return total
+
     def _under_rate_limit(self) -> bool:
         cutoff = time.monotonic() - 60.0
-        # Drop expired timestamps from the left
         while self.state.order_timestamps and self.state.order_timestamps[0] < cutoff:
             self.state.order_timestamps.popleft()
         return len(self.state.order_timestamps) < ORDERS_PER_MINUTE

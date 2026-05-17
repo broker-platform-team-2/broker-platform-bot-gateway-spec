@@ -1,24 +1,27 @@
 """
-The orchestrator.
+The orchestrator — v2.
 
-Day 2 wires the full pipeline:
+Pipeline:
+    PRICE_UPDATE      → market store → (every 12 msgs) strategy.decide()
+                        → risk.filter() → executor.submit_all()
+    ORDER_UPDATE      → executor.handle_order_update() + reconcile portfolio
+    MARKET_EVENT      → events.react() → risk.filter() → executor.submit_all()
+                        + schedule auto-exit when duration_ticks elapses
+    ORDER_BOOK_UPDATE → orderbook cache (used by strategy for spread/imbalance)
+    every 30 s        → reconcile portfolio + cash from /portfolio + /accounts/me
 
-    PRICE_UPDATE  ->  strategy.decide()  ->  risk.filter()  ->  executor.submit_all()
-    ORDER_UPDATE  ->  executor.handle_order_update()  +  refresh portfolio
-    every 30 s    ->  reconcile portfolio + cash from /portfolio + /accounts/me
-
-Day 3 will hook events.MARKET_EVENT and pyramiding in here too.
-
-Track B additions:
-  - ORDER_BOOK_UPDATE is now forwarded to an OrderBook cache; strategy uses
-    real best-ask prices for LIMIT entries when book data is available.
-  - When REPLAY_RECORD=1, a RunRecorder is attached to WsClient so every
-    incoming message is written to runs/<timestamp>.jsonl for later replay.
+v2 additions:
+  - orderbook passed to strategy.decide() for spread filter and imbalance signal
+  - entry_atr threaded from OrderIntent → Position so exit logic has ATR context
+  - event auto-expiry: positions opened on event are auto-sold after duration_ticks
+  - current_tick passed to events.react() for debounce
+  - peak_prices survive reconcile cycle (trailing stop levels persist)
 """
 from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -37,39 +40,51 @@ from .ws_client import WsClient
 log = get_logger(__name__)
 
 
-# Run the decision pipeline at most once per N PRICE_UPDATE messages so we
-# don't spam the strategy with every single ticker change (the WS sends one
-# message per ticker per tick).
+# Run the decision pipeline at most once per N PRICE_UPDATE messages.
+# With 8 tickers at 1 tick/sec the WS fires 8 msgs/sec; every 12 msgs ≈ 1.5 s.
 DECISION_INTERVAL_PRICE_UPDATES = 12
 
 
 class Bot:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.http = HttpClient(settings)
-        self.market = MarketStore()
+        self.http      = HttpClient(settings)
+        self.market    = MarketStore()
         self.orderbook = OrderBook()
-        self.ws = WsClient(settings, get_token=lambda: self.http.token)
-        self.strategy = Strategy()
-        self.executor = Executor(self.http)
-        self.events = EventReactor(self.strategy)
+        self.ws        = WsClient(settings, get_token=lambda: self.http.token)
+        self.strategy  = Strategy()
+        self.executor  = Executor(self.http)
+        self.events    = EventReactor(self.strategy)
 
         # Per-subscriber state — keyed by userId
         self._subscriber_portfolios: dict[int, PortfolioView] = {}
-        self._subscriber_risk_gates: dict[int, RiskGate] = {}
-        # Tracks quantities being sold that have not yet settled on the server.
-        # Reconcile subtracts these so it never restores a position mid-flight.
+        self._subscriber_risk_gates: dict[int, RiskGate]      = {}
+
+        # Tracks sell quantities mid-flight so reconcile doesn't restore them.
         self._pending_sells: dict[int, dict[str, int]] = {}
 
+        # Authoritative peak prices — survive the 30-s reconcile cycle.
+        self._peak_prices: dict[int, dict[str, Decimal]] = {}
+
+        # ATR values recorded at entry — used by _reconcile_subscriber to stamp
+        # entry_atr on Position objects so exit logic has the right stop level.
+        self._entry_atrs: dict[int, dict[str, Decimal]] = {}
+
+        # Event-driven position expiry.
+        # Keyed by (user_id, ticker) → monotonic expiry time.
+        # When time.monotonic() exceeds the value we emit an auto-sell.
+        # duration_ticks from the exchange ≈ real seconds (tick-rate-ms = 1000).
+        self._event_expires: dict[int, dict[str, float]] = {}
+
         self._price_update_counter = 0
-        self._decision_lock = asyncio.Lock()
+        self._decision_lock        = asyncio.Lock()
         self._reconcile_task: asyncio.Task[None] | None = None
 
     # --------------------------------------------------------------- bootstrap
+
     async def bootstrap(self) -> None:
         await self.http.authenticate()
         await self._snapshot_market()
-        # Prime per-subscriber portfolios
         for sub in await self.http.get_active_subscribers():
             await self._reconcile_subscriber(sub["userId"])
         self._register_handlers()
@@ -83,7 +98,7 @@ class Bot:
             log.warning("market.snapshot.failed", error=str(exc))
 
     async def _reconcile_subscriber(self, user_id: int) -> None:
-        """Pull cash + positions for one subscriber from the platform."""
+        """Pull cash + positions from the platform and rebuild PortfolioView."""
         try:
             accounts = await self.http.get_accounts(on_behalf_of=user_id)
             holdings = await self.http.get_portfolio(on_behalf_of=user_id)
@@ -101,7 +116,10 @@ class Bot:
                     cash = Decimal("0")
                 break
 
-        existing = self._subscriber_portfolios.get(user_id)
+        existing        = self._subscriber_portfolios.get(user_id)
+        user_peaks      = self._peak_prices.get(user_id, {})
+        user_entry_atrs = self._entry_atrs.get(user_id, {})
+
         new_positions: dict[str, Position] = {}
         for h in holdings:
             ticker = h.get("instrumentId") or h.get("ticker")
@@ -114,12 +132,19 @@ class Bot:
                 continue
             if qty <= 0:
                 continue
-            existing_pos = existing.positions.get(ticker) if existing else None
-            peak = existing_pos.peak_price if existing_pos else avg
-            new_positions[ticker] = Position(ticker=ticker, quantity=qty, avg_cost=avg, peak_price=peak)
 
-        # Subtract any pending sells so a mid-flight order doesn't restore
-        # a position that we already placed a sell for but hasn't settled yet.
+            existing_pos = existing.positions.get(ticker) if existing else None
+            peak      = user_peaks.get(ticker) or (existing_pos.peak_price if existing_pos else avg)
+            # Restore entry_atr from our internal store so exit logic keeps
+            # the ATR that was recorded at the moment of entry, not recalculated.
+            entry_atr = user_entry_atrs.get(ticker, Decimal("0"))
+
+            new_positions[ticker] = Position(
+                ticker=ticker, quantity=qty, avg_cost=avg,
+                peak_price=peak, entry_atr=entry_atr,
+            )
+
+        # Subtract pending sells — don't let reconcile undo an in-flight sell.
         pending_sells = self._pending_sells.get(user_id, {})
         for ticker, pending_qty in list(pending_sells.items()):
             if ticker in new_positions:
@@ -131,15 +156,24 @@ class Bot:
                     new_positions[ticker] = Position(
                         ticker=pos.ticker, quantity=adjusted,
                         avg_cost=pos.avg_cost, peak_price=pos.peak_price,
+                        entry_atr=pos.entry_atr,
                     )
             else:
-                # Server confirms position is gone — order settled, clear pending entry
                 pending_sells.pop(ticker, None)
+
+        # Drop stale peak / atr entries for positions closed on the server.
+        open_tickers = set(new_positions)
+        for store in (self._peak_prices.get(user_id, {}),
+                      self._entry_atrs.get(user_id, {})):
+            for stale in [t for t in list(store) if t not in open_tickers]:
+                store.pop(stale, None)
 
         portfolio = PortfolioView(cash=cash, positions=new_positions)
         self._subscriber_portfolios[user_id] = portfolio
-        log.info("reconcile.ok", user_id=user_id, cash=str(cash),
-                 positions=len(new_positions), equity=str(portfolio.equity(self.market)))
+        log.info(
+            "reconcile.ok", user_id=user_id, cash=str(cash),
+            positions=len(new_positions), equity=str(portfolio.equity(self.market)),
+        )
 
     async def _reconcile_loop(self) -> None:
         while True:
@@ -148,10 +182,11 @@ class Bot:
                 await self._reconcile_subscriber(sub["userId"])
 
     # ----------------------------------------------------------------- handlers
+
     def _register_handlers(self) -> None:
-        self.ws.on("PRICE_UPDATE", self._on_price_update)
-        self.ws.on("ORDER_UPDATE", self._on_order_update)
-        self.ws.on("MARKET_EVENT", self._on_market_event)
+        self.ws.on("PRICE_UPDATE",      self._on_price_update)
+        self.ws.on("ORDER_UPDATE",      self._on_order_update)
+        self.ws.on("MARKET_EVENT",      self._on_market_event)
         self.ws.on("ORDER_BOOK_UPDATE", self._on_order_book_update)
 
     async def _on_price_update(self, payload: dict[str, Any]) -> None:
@@ -178,18 +213,35 @@ class Bot:
             if portfolio is None:
                 continue
 
-            intents = self.strategy.decide(self.market, portfolio)
+            # Inject auto-sell intents for event-driven positions that have expired
+            expiry_intents = self._collect_event_expiry_intents(user_id, portfolio)
+
+            # Strategy decision — now includes orderbook for spread/imbalance
+            intents = self.strategy.decide(self.market, portfolio, orderbook=self.orderbook)
+            intents = expiry_intents + intents
+
+            # Persist peak prices updated by _exit_decision so they survive
+            # the next reconcile cycle.
+            peaks = self._peak_prices.setdefault(user_id, {})
+            for ticker, pos in portfolio.positions.items():
+                peaks[ticker] = pos.peak_price
+
             if not intents:
                 continue
 
-            risk = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+            risk    = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
             allowed = risk.filter(intents, portfolio, self.market)
             if not allowed:
                 continue
 
-            log.info("decisions", user_id=user_id, proposed=len(intents), allowed=len(allowed),
-                     actions=[{"side": i.side, "ticker": i.ticker,
-                                "qty": i.quantity, "reason": i.reason} for i in allowed])
+            log.info(
+                "decisions", user_id=user_id,
+                proposed=len(intents), allowed=len(allowed),
+                actions=[{
+                    "side": i.side, "ticker": i.ticker,
+                    "qty": i.quantity, "reason": i.reason,
+                } for i in allowed],
+            )
             await self.executor.submit_all(allowed, on_behalf_of=user_id)
             self._apply_optimistic_update(user_id, allowed)
 
@@ -201,74 +253,160 @@ class Bot:
                 await self._reconcile_subscriber(sub["userId"])
 
     async def _on_market_event(self, payload: dict[str, Any]) -> None:
+        # Refresh scores so EventReactor picks tickers on current data.
+        self.strategy._score_all(self.market, orderbook=self.orderbook)  # noqa: SLF001
+
         subscribers = await self.http.get_active_subscribers()
         if not subscribers:
             return
 
-        log.info("market_event",
-                 event_type=payload.get("event_type") or payload.get("eventType"),
-                 headline=payload.get("headline"),
-                 scope=payload.get("scope"),
-                 target=payload.get("target"))
-
-        self.strategy._score_all(self.market)  # noqa: SLF001
+        event_type = payload.get("event_type") or payload.get("eventType")
+        log.info(
+            "market_event",
+            event_type=event_type,
+            headline=payload.get("headline"),
+            scope=payload.get("scope"),
+            target=payload.get("target"),
+            magnitude=payload.get("magnitude"),
+            duration_ticks=payload.get("duration_ticks"),
+        )
 
         for sub in subscribers:
-            user_id = sub["userId"]
-            portfolio = self._subscriber_portfolios.get(user_id, PortfolioView(cash=Decimal("0")))
-            intents = self.events.react(payload, self.market, portfolio)
+            user_id   = sub["userId"]
+            portfolio = self._subscriber_portfolios.get(
+                user_id, PortfolioView(cash=Decimal("0"))
+            )
+
+            # Pass current_tick for debounce; returns (intents, duration_ticks)
+            intents, duration = self.events.react(
+                payload, self.market, portfolio,
+                current_tick=self._price_update_counter,
+            )
             if not intents:
                 continue
-            risk = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+
+            risk    = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
             allowed = risk.filter(intents, portfolio, self.market)
             if not allowed:
                 continue
-            log.info("event.actions", user_id=user_id,
-                     event_type=payload.get("event_type") or payload.get("eventType"),
-                     proposed=len(intents), allowed=len(allowed))
+
+            log.info(
+                "event.actions", user_id=user_id, event_type=event_type,
+                proposed=len(intents), allowed=len(allowed),
+            )
             await self.executor.submit_all(allowed, on_behalf_of=user_id)
             self._apply_optimistic_update(user_id, allowed)
+
+            # Schedule auto-exit for event-driven BUY positions.
+            # duration is in simulation ticks (1 tick ≈ 1 real second).
+            if duration > 0:
+                expire_at = time.monotonic() + float(duration)
+                user_expires = self._event_expires.setdefault(user_id, {})
+                for intent in allowed:
+                    if intent.side == "BUY":
+                        user_expires[intent.ticker] = expire_at
+                        log.info(
+                            "event.expiry_scheduled",
+                            ticker=intent.ticker,
+                            expire_in_s=duration,
+                        )
 
     async def _on_order_book_update(self, payload: dict[str, Any]) -> None:
         self.orderbook.apply_update(payload)
         log.debug("orderbook.updated", ticker=payload.get("ticker") or payload.get("symbol"))
 
-    def _apply_optimistic_update(self, user_id: int, intents: list) -> None:
-        """Immediately reflect placed orders in local portfolio state.
+    # --------------------------------------------------------- event expiry
 
-        Also records sells in _pending_sells so that reconcile cannot restore
-        a position while its sell order is still settling on the exchange.
-        """
+    def _collect_event_expiry_intents(
+        self,
+        user_id: int,
+        portfolio: PortfolioView,
+    ) -> list:
+        """Return SELL intents for event-driven positions whose duration has elapsed."""
+        from .strategy import OrderIntent  # local to avoid circular at module level
+
+        user_expires = self._event_expires.get(user_id)
+        if not user_expires:
+            return []
+
+        now     = time.monotonic()
+        expired = [t for t, exp in user_expires.items() if now >= exp]
+        intents = []
+        for ticker in expired:
+            del user_expires[ticker]
+            pos = portfolio.positions.get(ticker)
+            if pos and pos.quantity > 0:
+                log.info("event.expiry_sell", ticker=ticker, user_id=user_id)
+                intents.append(OrderIntent(
+                    side="SELL", ticker=ticker, quantity=pos.quantity,
+                    order_type="MARKET", reason="event_expired",
+                ))
+        return intents
+
+    # ------------------------------------------------- optimistic update
+
+    def _apply_optimistic_update(self, user_id: int, intents: list) -> None:
         portfolio = self._subscriber_portfolios.get(user_id)
         if portfolio is None:
             return
+
         new_positions = dict(portfolio.positions)
-        pending = self._pending_sells.setdefault(user_id, {})
+        pending    = self._pending_sells.setdefault(user_id, {})
+        peaks      = self._peak_prices.setdefault(user_id, {})
+        entry_atrs = self._entry_atrs.setdefault(user_id, {})
+
         for intent in intents:
             if intent.side == "SELL" and intent.ticker in new_positions:
-                pos = new_positions[intent.ticker]
+                pos     = new_positions[intent.ticker]
                 new_qty = pos.quantity - intent.quantity
                 if new_qty <= 0:
                     del new_positions[intent.ticker]
+                    peaks.pop(intent.ticker, None)
+                    entry_atrs.pop(intent.ticker, None)
                 else:
                     new_positions[intent.ticker] = Position(
                         ticker=pos.ticker, quantity=new_qty,
                         avg_cost=pos.avg_cost, peak_price=pos.peak_price,
+                        entry_atr=pos.entry_atr,
                     )
-                # Record pending so reconcile doesn't undo this
                 pending[intent.ticker] = pending.get(intent.ticker, 0) + intent.quantity
+
+            elif intent.side == "BUY":
+                state = self.market.get(intent.ticker)
+                price = (
+                    Decimal(str(state.price)) if state
+                    else (intent.limit_price or Decimal("0"))
+                )
+                if intent.entry_atr > 0:
+                    entry_atrs[intent.ticker] = intent.entry_atr
+
+                if intent.ticker in new_positions:
+                    pos       = new_positions[intent.ticker]
+                    total_qty = pos.quantity + intent.quantity
+                    new_avg   = (pos.avg_cost * pos.quantity + price * intent.quantity) / total_qty
+                    new_positions[intent.ticker] = Position(
+                        ticker=pos.ticker, quantity=total_qty,
+                        avg_cost=new_avg, peak_price=max(pos.peak_price, price),
+                        entry_atr=pos.entry_atr or intent.entry_atr,
+                    )
+                else:
+                    new_positions[intent.ticker] = Position(
+                        ticker=intent.ticker, quantity=intent.quantity,
+                        avg_cost=price, peak_price=price,
+                        entry_atr=intent.entry_atr,
+                    )
+                peaks[intent.ticker] = max(peaks.get(intent.ticker, price), price)
+
         self._subscriber_portfolios[user_id] = PortfolioView(
             cash=portfolio.cash, positions=new_positions,
         )
 
     # ---------------------------------------------------------------- run loop
+
     async def run(self) -> None:
         configure_logging(self.settings.log_level)
-        log.info(
-            "bot.start",
-            gateway=self.settings.gateway_http_url,
-            email=self.settings.bot_email,
-        )
+        log.info("bot.start", gateway=self.settings.gateway_http_url,
+                 email=self.settings.bot_email)
         await self.bootstrap()
 
         if recording_enabled():
@@ -279,7 +417,9 @@ class Bot:
             recorder = None
 
         await self.ws.start()
-        self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_loop(), name="reconcile"
+        )
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -287,8 +427,6 @@ class Bot:
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except NotImplementedError:
-                # Windows asyncio doesn't support add_signal_handler - KeyboardInterrupt
-                # bubbles up naturally there.
                 pass
 
         try:
