@@ -173,7 +173,7 @@ class Bot:
             await self._run_decision_cycle()
 
     async def _run_decision_cycle(self) -> None:
-        intents = self.strategy.decide(self.market, self.portfolio, self.orderbook)
+        intents = self.strategy.decide(self.market, self.portfolio)
         if not intents:
             return
         allowed = self.risk.filter(intents, self.portfolio, self.market)
