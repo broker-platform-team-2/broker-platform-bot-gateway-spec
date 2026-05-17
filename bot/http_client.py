@@ -95,16 +95,16 @@ class HttpClient:
         *,
         json: Any | None = None,
         params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        headers = self._auth_headers()
+        headers = {**self._auth_headers(), **(extra_headers or {})}
         r = await self._client.request(method, path, json=json, params=params, headers=headers)
         if r.status_code == 401 and self._token is not None:
             log.warning("http.401.relogin", path=path)
             self._token = None
             await self.authenticate()
-            r = await self._client.request(
-                method, path, json=json, params=params, headers=self._auth_headers()
-            )
+            headers = {**self._auth_headers(), **(extra_headers or {})}
+            r = await self._client.request(method, path, json=json, params=params, headers=headers)
         return r
 
     def _auth_headers(self) -> dict[str, str]:
@@ -112,9 +112,15 @@ class HttpClient:
             return {}
         return {"Authorization": f"Bearer {self._token}"}
 
+    def _behalf_headers(self, on_behalf_of: int | None) -> dict[str, str]:
+        if on_behalf_of is None:
+            return {}
+        return {"X-On-Behalf-Of": str(on_behalf_of)}
+
     # ---------------------------------------------------------- endpoint helpers
-    async def get_accounts(self) -> list[dict[str, Any]]:
-        r = await self._request("GET", "/accounts/me")
+    async def get_accounts(self, on_behalf_of: int | None = None) -> list[dict[str, Any]]:
+        r = await self._request("GET", "/accounts/me",
+                                extra_headers=self._behalf_headers(on_behalf_of))
         r.raise_for_status()
         return r.json()
 
@@ -124,15 +130,15 @@ class HttpClient:
         r.raise_for_status()
         return r.json()
 
-    async def get_portfolio(self) -> list[dict[str, Any]]:
-        r = await self._request("GET", "/portfolio")
+    async def get_portfolio(self, on_behalf_of: int | None = None) -> list[dict[str, Any]]:
+        r = await self._request("GET", "/portfolio",
+                                extra_headers=self._behalf_headers(on_behalf_of))
         r.raise_for_status()
         return r.json()
 
-    async def get_portfolio_ticker_qty(self, ticker: str) -> int:
-        """Held quantity for one ticker (0 if not held). Used by reconcile-then-retry."""
+    async def get_portfolio_ticker_qty(self, ticker: str, on_behalf_of: int | None = None) -> int:
         try:
-            holdings = await self.get_portfolio()
+            holdings = await self.get_portfolio(on_behalf_of=on_behalf_of)
         except Exception:  # noqa: BLE001
             return 0
         for h in holdings:
@@ -143,6 +149,22 @@ class HttpClient:
                 except (TypeError, ValueError):
                     return 0
         return 0
+
+    async def get_active_subscribers(self) -> list[dict[str, Any]]:
+        try:
+            r = await self._request("GET", "/bots/active-subscribers")
+            r.raise_for_status()
+            return r.json()
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def get_bot_enabled(self) -> bool:
+        try:
+            r = await self._request("GET", "/bots/any-active")
+            r.raise_for_status()
+            return bool(r.json().get("enabled", False))
+        except Exception:  # noqa: BLE001
+            return False
 
     async def get_market_snapshot(self) -> list[dict[str, Any]]:
         r = await self._request("GET", "/exchange/market/stocks")
@@ -166,6 +188,7 @@ class HttpClient:
         quantity: int,
         limit_price: Decimal | None = None,
         expires_at: str | None = None,
+        on_behalf_of: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "instrumentType": instrument_type,
@@ -178,7 +201,8 @@ class HttpClient:
             body["limitPrice"] = str(limit_price)
         if expires_at is not None:
             body["expiresAt"] = expires_at
-        r = await self._request("POST", "/orders", json=body)
+        r = await self._request("POST", "/orders", json=body,
+                                extra_headers=self._behalf_headers(on_behalf_of))
         r.raise_for_status()
         return r.json()
 
