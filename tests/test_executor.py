@@ -79,7 +79,7 @@ async def test_timeout_triggers_reconcile_then_retry_when_not_placed():
     assert oo is not None
     assert oo.order_id == "ORD-RETRY"
     assert attempt["n"] == 2
-    http.get_portfolio_ticker_qty.assert_awaited_once_with("ARKA")
+    http.get_portfolio_ticker_qty.assert_awaited_once_with("ARKA", on_behalf_of=None)
 
 
 async def test_timeout_no_retry_when_order_already_placed():
@@ -101,7 +101,7 @@ async def test_timeout_no_retry_when_order_already_placed():
 
     assert oo is None  # reconcile confirmed placed; no retry needed
     assert attempt["n"] == 1  # only the initial attempt
-    http.get_portfolio_ticker_qty.assert_awaited_once_with("ARKA")
+    http.get_portfolio_ticker_qty.assert_awaited_once_with("ARKA", on_behalf_of=None)
 
 
 async def test_5xx_triggers_reconcile_then_retry():
