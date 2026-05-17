@@ -41,12 +41,8 @@ class Executor:
         self.http = http
         self.open_orders: dict[str, OpenOrder] = {}
 
-    async def submit(self, intent: OrderIntent) -> OpenOrder | None:
-        """Place one order. Returns the OpenOrder, or None on failure.
-
-        On timeout or 5xx: reconcile against /portfolio before deciding
-        whether to retry, to avoid double-placing without an idempotency key.
-        """
+    async def submit(self, intent: OrderIntent, on_behalf_of: int | None = None) -> OpenOrder | None:
+        """Place one order. Returns the OpenOrder, or None on failure."""
         try:
             resp = await self.http.place_order(
                 instrument_type="STOCK",
@@ -55,14 +51,15 @@ class Executor:
                 side=intent.side,
                 quantity=intent.quantity,
                 limit_price=intent.limit_price,
+                on_behalf_of=on_behalf_of,
             )
         except httpx.TimeoutException:
             log.warning("exec.timeout", ticker=intent.ticker, side=intent.side, qty=intent.quantity)
-            return await self._reconcile_then_retry(intent)
+            return await self._reconcile_then_retry(intent, on_behalf_of=on_behalf_of)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code >= 500:
                 log.warning("exec.5xx", ticker=intent.ticker, status=exc.response.status_code)
-                return await self._reconcile_then_retry(intent)
+                return await self._reconcile_then_retry(intent, on_behalf_of=on_behalf_of)
             log.error("exec.place_failed", ticker=intent.ticker, side=intent.side,
                       qty=intent.quantity, reason=intent.reason, error=str(exc))
             return None
@@ -73,10 +70,10 @@ class Executor:
 
         return self._register_placed(intent, resp)
 
-    async def submit_all(self, intents: list[OrderIntent]) -> list[OpenOrder]:
+    async def submit_all(self, intents: list[OrderIntent], on_behalf_of: int | None = None) -> list[OpenOrder]:
         results: list[OpenOrder] = []
         for intent in intents:
-            placed = await self.submit(intent)
+            placed = await self.submit(intent, on_behalf_of=on_behalf_of)
             if placed:
                 results.append(placed)
         return results
@@ -129,11 +126,11 @@ class Executor:
                  reason=intent.reason)
         return oo
 
-    async def _reconcile_then_retry(self, intent: OrderIntent) -> OpenOrder | None:
+    async def _reconcile_then_retry(self, intent: OrderIntent, on_behalf_of: int | None = None) -> OpenOrder | None:
         """After a timeout or 5xx, check /portfolio before retrying."""
         await asyncio.sleep(1.0)
 
-        held_qty = await self.http.get_portfolio_ticker_qty(intent.ticker)
+        held_qty = await self.http.get_portfolio_ticker_qty(intent.ticker, on_behalf_of=on_behalf_of)
         order_appears_placed = (
             (intent.side == "BUY" and held_qty > 0)
             or (intent.side == "SELL" and held_qty == 0)
@@ -153,6 +150,7 @@ class Executor:
                 side=intent.side,
                 quantity=intent.quantity,
                 limit_price=intent.limit_price,
+                on_behalf_of=on_behalf_of,
             )
         except Exception as exc:  # noqa: BLE001
             log.error("exec.retry.failed", ticker=intent.ticker, side=intent.side, error=str(exc))

@@ -51,11 +51,16 @@ class Bot:
         self.orderbook = OrderBook()
         self.ws = WsClient(settings, get_token=lambda: self.http.token)
         self.strategy = Strategy()
-        self.risk = RiskGate()
         self.executor = Executor(self.http)
         self.events = EventReactor(self.strategy)
 
-        self.portfolio = PortfolioView(cash=Decimal("0"))
+        # Per-subscriber state — keyed by userId
+        self._subscriber_portfolios: dict[int, PortfolioView] = {}
+        self._subscriber_risk_gates: dict[int, RiskGate] = {}
+        # Tracks quantities being sold that have not yet settled on the server.
+        # Reconcile subtracts these so it never restores a position mid-flight.
+        self._pending_sells: dict[int, dict[str, int]] = {}
+
         self._price_update_counter = 0
         self._decision_lock = asyncio.Lock()
         self._reconcile_task: asyncio.Task[None] | None = None
@@ -63,36 +68,11 @@ class Bot:
     # --------------------------------------------------------------- bootstrap
     async def bootstrap(self) -> None:
         await self.http.authenticate()
-        await self._ensure_funded()
-        await self._reconcile_portfolio()
         await self._snapshot_market()
+        # Prime per-subscriber portfolios
+        for sub in await self.http.get_active_subscribers():
+            await self._reconcile_subscriber(sub["userId"])
         self._register_handlers()
-
-    async def _ensure_funded(self) -> None:
-        accounts = await self.http.get_accounts()
-        target_currency = self.settings.seed_currency.upper()
-        balance = Decimal("0")
-        for acc in accounts:
-            ccy = (acc.get("currency") or "").upper()
-            if ccy == target_currency:
-                bal_raw = acc.get("balance") or acc.get("available") or "0"
-                try:
-                    balance = Decimal(str(bal_raw))
-                except Exception:  # noqa: BLE001
-                    balance = Decimal("0")
-                break
-
-        if balance < self.settings.seed_deposit:
-            top_up = self.settings.seed_deposit - balance
-            log.info(
-                "funds.topping_up",
-                currency=target_currency,
-                current=str(balance),
-                deposit=str(top_up),
-            )
-            await self.http.deposit(target_currency, top_up)
-        else:
-            log.info("funds.ok", currency=target_currency, balance=str(balance))
 
     async def _snapshot_market(self) -> None:
         try:
@@ -102,16 +82,15 @@ class Bot:
         except Exception as exc:  # noqa: BLE001
             log.warning("market.snapshot.failed", error=str(exc))
 
-    async def _reconcile_portfolio(self) -> None:
-        """Pull cash + positions from the platform - source of truth."""
+    async def _reconcile_subscriber(self, user_id: int) -> None:
+        """Pull cash + positions for one subscriber from the platform."""
         try:
-            accounts = await self.http.get_accounts()
-            holdings = await self.http.get_portfolio()
+            accounts = await self.http.get_accounts(on_behalf_of=user_id)
+            holdings = await self.http.get_portfolio(on_behalf_of=user_id)
         except Exception as exc:  # noqa: BLE001
-            log.warning("reconcile.failed", error=str(exc))
+            log.warning("reconcile.subscriber.failed", user_id=user_id, error=str(exc))
             return
 
-        # Cash
         target_currency = self.settings.seed_currency.upper()
         cash = Decimal("0")
         for acc in accounts:
@@ -122,7 +101,7 @@ class Bot:
                     cash = Decimal("0")
                 break
 
-        # Positions
+        existing = self._subscriber_portfolios.get(user_id)
         new_positions: dict[str, Position] = {}
         for h in holdings:
             ticker = h.get("instrumentId") or h.get("ticker")
@@ -135,24 +114,38 @@ class Bot:
                 continue
             if qty <= 0:
                 continue
-            existing_peak = self.portfolio.positions.get(ticker)
-            peak = existing_peak.peak_price if existing_peak else avg
-            new_positions[ticker] = Position(
-                ticker=ticker, quantity=qty, avg_cost=avg, peak_price=peak
-            )
+            existing_pos = existing.positions.get(ticker) if existing else None
+            peak = existing_pos.peak_price if existing_pos else avg
+            new_positions[ticker] = Position(ticker=ticker, quantity=qty, avg_cost=avg, peak_price=peak)
 
-        self.portfolio = PortfolioView(cash=cash, positions=new_positions)
-        log.info(
-            "reconcile.ok",
-            cash=str(cash),
-            positions=len(new_positions),
-            equity=str(self.portfolio.equity(self.market)),
-        )
+        # Subtract any pending sells so a mid-flight order doesn't restore
+        # a position that we already placed a sell for but hasn't settled yet.
+        pending_sells = self._pending_sells.get(user_id, {})
+        for ticker, pending_qty in list(pending_sells.items()):
+            if ticker in new_positions:
+                adjusted = new_positions[ticker].quantity - pending_qty
+                if adjusted <= 0:
+                    del new_positions[ticker]
+                else:
+                    pos = new_positions[ticker]
+                    new_positions[ticker] = Position(
+                        ticker=pos.ticker, quantity=adjusted,
+                        avg_cost=pos.avg_cost, peak_price=pos.peak_price,
+                    )
+            else:
+                # Server confirms position is gone — order settled, clear pending entry
+                pending_sells.pop(ticker, None)
+
+        portfolio = PortfolioView(cash=cash, positions=new_positions)
+        self._subscriber_portfolios[user_id] = portfolio
+        log.info("reconcile.ok", user_id=user_id, cash=str(cash),
+                 positions=len(new_positions), equity=str(portfolio.equity(self.market)))
 
     async def _reconcile_loop(self) -> None:
         while True:
             await asyncio.sleep(30.0)
-            await self._reconcile_portfolio()
+            for sub in await self.http.get_active_subscribers():
+                await self._reconcile_subscriber(sub["userId"])
 
     # ----------------------------------------------------------------- handlers
     def _register_handlers(self) -> None:
@@ -166,71 +159,107 @@ class Bot:
         self._price_update_counter += 1
         if self._price_update_counter % DECISION_INTERVAL_PRICE_UPDATES != 0:
             return
-        # Don't let two ticks of decisions run concurrently.
         if self._decision_lock.locked():
             return
         async with self._decision_lock:
             await self._run_decision_cycle()
 
     async def _run_decision_cycle(self) -> None:
-        intents = self.strategy.decide(self.market, self.portfolio)
-        if not intents:
+        subscribers = await self.http.get_active_subscribers()
+        if not subscribers:
+            log.info("bot.paused", reason="no active subscribers")
             return
-        allowed = self.risk.filter(intents, self.portfolio, self.market)
-        if not allowed:
-            return
-        log.info(
-            "decisions",
-            proposed=len(intents),
-            allowed=len(allowed),
-            actions=[
-                {"side": i.side, "ticker": i.ticker, "qty": i.quantity, "reason": i.reason}
-                for i in allowed
-            ],
-        )
-        await self.executor.submit_all(allowed)
+
+        for sub in subscribers:
+            user_id = sub["userId"]
+            if user_id not in self._subscriber_portfolios:
+                await self._reconcile_subscriber(user_id)
+            portfolio = self._subscriber_portfolios.get(user_id)
+            if portfolio is None:
+                continue
+
+            intents = self.strategy.decide(self.market, portfolio)
+            if not intents:
+                continue
+
+            risk = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+            allowed = risk.filter(intents, portfolio, self.market)
+            if not allowed:
+                continue
+
+            log.info("decisions", user_id=user_id, proposed=len(intents), allowed=len(allowed),
+                     actions=[{"side": i.side, "ticker": i.ticker,
+                                "qty": i.quantity, "reason": i.reason} for i in allowed])
+            await self.executor.submit_all(allowed, on_behalf_of=user_id)
+            self._apply_optimistic_update(user_id, allowed)
 
     async def _on_order_update(self, payload: dict[str, Any]) -> None:
         self.executor.handle_order_update(payload)
         status = payload.get("status")
         if status in ("FILLED", "PARTIALLY_FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
-            # Fast-path reconcile so the next decision cycle sees the new state.
-            await self._reconcile_portfolio()
+            for sub in await self.http.get_active_subscribers():
+                await self._reconcile_subscriber(sub["userId"])
 
     async def _on_market_event(self, payload: dict[str, Any]) -> None:
-        # Track A: event reactor runs immediately — speed matters more than
-        # confirmation here. Intents still flow through the risk gate.
-        log.info(
-            "market_event",
-            event_type=payload.get("event_type") or payload.get("eventType"),
-            headline=payload.get("headline"),
-            scope=payload.get("scope"),
-            target=payload.get("target"),
-        )
-        # Refresh the strategy's score cache so the reactor's "top-N" ranks
-        # are based on the latest data. This is cheap (~ms).
-        self.strategy._score_all(self.market)  # noqa: SLF001 — same-package
-        intents = self.events.react(payload, self.market, self.portfolio)
-        if not intents:
+        subscribers = await self.http.get_active_subscribers()
+        if not subscribers:
             return
-        allowed = self.risk.filter(intents, self.portfolio, self.market)
-        if not allowed:
-            return
-        log.info(
-            "event.actions",
-            event_type=payload.get("event_type") or payload.get("eventType"),
-            proposed=len(intents),
-            allowed=len(allowed),
-            actions=[
-                {"side": i.side, "ticker": i.ticker, "qty": i.quantity, "reason": i.reason}
-                for i in allowed
-            ],
-        )
-        await self.executor.submit_all(allowed)
+
+        log.info("market_event",
+                 event_type=payload.get("event_type") or payload.get("eventType"),
+                 headline=payload.get("headline"),
+                 scope=payload.get("scope"),
+                 target=payload.get("target"))
+
+        self.strategy._score_all(self.market)  # noqa: SLF001
+
+        for sub in subscribers:
+            user_id = sub["userId"]
+            portfolio = self._subscriber_portfolios.get(user_id, PortfolioView(cash=Decimal("0")))
+            intents = self.events.react(payload, self.market, portfolio)
+            if not intents:
+                continue
+            risk = self._subscriber_risk_gates.setdefault(user_id, RiskGate())
+            allowed = risk.filter(intents, portfolio, self.market)
+            if not allowed:
+                continue
+            log.info("event.actions", user_id=user_id,
+                     event_type=payload.get("event_type") or payload.get("eventType"),
+                     proposed=len(intents), allowed=len(allowed))
+            await self.executor.submit_all(allowed, on_behalf_of=user_id)
+            self._apply_optimistic_update(user_id, allowed)
 
     async def _on_order_book_update(self, payload: dict[str, Any]) -> None:
         self.orderbook.apply_update(payload)
         log.debug("orderbook.updated", ticker=payload.get("ticker") or payload.get("symbol"))
+
+    def _apply_optimistic_update(self, user_id: int, intents: list) -> None:
+        """Immediately reflect placed orders in local portfolio state.
+
+        Also records sells in _pending_sells so that reconcile cannot restore
+        a position while its sell order is still settling on the exchange.
+        """
+        portfolio = self._subscriber_portfolios.get(user_id)
+        if portfolio is None:
+            return
+        new_positions = dict(portfolio.positions)
+        pending = self._pending_sells.setdefault(user_id, {})
+        for intent in intents:
+            if intent.side == "SELL" and intent.ticker in new_positions:
+                pos = new_positions[intent.ticker]
+                new_qty = pos.quantity - intent.quantity
+                if new_qty <= 0:
+                    del new_positions[intent.ticker]
+                else:
+                    new_positions[intent.ticker] = Position(
+                        ticker=pos.ticker, quantity=new_qty,
+                        avg_cost=pos.avg_cost, peak_price=pos.peak_price,
+                    )
+                # Record pending so reconcile doesn't undo this
+                pending[intent.ticker] = pending.get(intent.ticker, 0) + intent.quantity
+        self._subscriber_portfolios[user_id] = PortfolioView(
+            cash=portfolio.cash, positions=new_positions,
+        )
 
     # ---------------------------------------------------------------- run loop
     async def run(self) -> None:
